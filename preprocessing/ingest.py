@@ -8,55 +8,52 @@ import numpy as np
 import geopandas
 import shapely
 class make_parquet:
-    def __init__(self,cell_by_gene=None,cell_meta=None,cellpose=False,input_format='Csv'):
+    def __init__(self,cell_by_gene=None,cell_meta=None,input_format='csv'):
         """
+        Initializes the make_parquet object with cell by gene and cell metadata.
+
         Parameters:
-                    cell_by_gene: str, required
-                        Full path to cell_by_gene.csv output by vizgen containing cell by gene matrix
+        - cell_by_gene (str): Full path to the cell_by_gene.csv file containing the cell by gene matrix.
+        - cell_meta (str): Full path to the cell_metadata.csv file containing cell geometry on an x, y plane.
+        - input_format (str, optional): Format of the input files. Can be 'csv' or 'Anndata' (default is 'csv').
 
-                    cell_meta: str, required
-                        Full path to cell_metadata.csv output by vizgen, containing cell geometry on a x, y plane.
-
-                    cell_pose: bool, default=False
-                        If the cell_by_gene and cell_meta are the output from cellpose segmentation algorithm instead of watershed.
-
-                    input_format: str, default='Csv'
-                        Specify the input format. Accepts either 'Csv' or 'Anndata' for now
-
-
+        Raises:
+        - AssertionError: If the input_format is not one of ['csv', 'Anndata'].
         """
-        assert input_format in ['Csv', 'Anndata'], "Invalid input_format. Should be one of ['Csv', 'Anndata']"
-        if input_format=='Csv':
-            self.cell_by_gene=dd.read_table(cell_by_gene,sep=',')
-            self.cell_meta=dd.read_table(cell_meta,sep=',')
-            self.cell_meta=self.cell_meta.rename(columns={self.cell_meta.columns[0]:"cell"})
-            self.cell_meta=self.cell_meta.set_index(self.cell_meta.columns[0])
-            self.cell_meta.index=self.cell_meta.index.rename('cell')
-            # Check for existence of 'x_min', 'y_min', 'x_max', 'y_max' and handle if not present
-            required_columns = ['x_min', 'y_min', 'x_max', 'y_max']
-            for col in required_columns:
-                if col not in self.cell_meta.columns:
-                    self.cell_meta[col] = 0  # Replace 0 with an appropriate default value if necessary
-
-        elif input_format=='Anndata':
-            import anndata
-            self.anndata=anndata.read_h5ad(cell_by_gene)
-            self.cell_by_gene=pd.DataFrame(self.anndata.X,index=self.anndata.obs['cell'],columns=self.anndata.var_names)
-            self.cell_by_gene= dd.from_pandas(self.cell_by_gene,chunksize=10000,sort=False)
-            # Default values for 'min_x', 'min_y', 'max_x', and 'max_y'
-            default_value = 0  # can set this to an appropriate value later
-            meta_data_columns = ['x','y'] + ['min_x', 'min_y', 'max_x', 'max_y']
-            self.cell_meta = pd.DataFrame(index=self.anndata.obs['cell'])
-            for col in meta_data_columns:
-                if col in self.anndata.obs.columns:
-                    self.cell_meta[col] = self.anndata.obs[col]
-                else:
-                    # Set the default value if the column is missing
-                    self.cell_meta[col] = default_value
-            self.cell_meta=dd.from_pandas(self.cell_meta,chunksize=10000,sort=False)
+        assert input_format in ['csv', 'Anndata'], "Invalid input_format. Should be one of ['csv', 'Anndata']"
+        self.load_data(cell_by_gene, cell_meta, input_format)
         self.prefilt_cell_sum=utils._sum.sum_per_cell(self.cell_by_gene,exclude_blanks=True)
         self.prefilt_trx_sum=utils._sum.sum_per_trx(self.cell_by_gene)
-        self.prefilt_cell_num=len(self.prefilt_cell_sum)
+        self.prefilt_cell_num=len(self.prefilt_cell_sum)        
+    def load_data(self,cell_by_gene, cell_meta, input_format):
+        if input_format == "csv":
+            self.load_csv_data(cell_by_gene,cell_meta)
+        elif input_format == "Anndata":
+            self.load_anndata(cell_by_gene)
+    def read_dd(self,infile):
+        _in=dd.read_table(infile,sep=',')
+        _in=_in.rename(columns={_in.columns[0]:"cell"})
+        _in=_in.set_index('cell')
+        return _in
+    def load_csv_data(self,cell_by_gene,cell_meta):
+        self.cell_by_gene=self.read_dd(cell_by_gene)
+        self.cell_meta=self.read_dd(cell_meta)
+    def load_anndata(self,cell_by_gene):
+        import anndata
+        self.anndata=anndata.read_h5ad(cell_by_gene)
+        self.cell_by_gene=pd.DataFrame(self.anndata.X,index=self.anndata.obs['cell'],columns=self.anndata.var_names)
+        self.cell_by_gene= dd.from_pandas(self.cell_by_gene,chunksize=10000,sort=False)
+        default_value = 0  # can set this to an appropriate value later
+        meta_data_columns = ['x','y'] + ['min_x', 'min_y', 'max_x', 'max_y']
+        self.cell_meta = pd.DataFrame(index=self.anndata.obs['cell'])
+        for col in meta_data_columns:
+            if col in self.anndata.obs.columns:
+                self.cell_meta[col] = self.anndata.obs[col]
+            else:
+                # Set the default value if the column is missing
+                self.cell_meta[col] = default_value
+        self.cell_meta=dd.from_pandas(self.cell_meta,chunksize=10000,sort=False)
+
     def filt(self,lower_threshold=0,upper_threshold=300, output_name='filt/',output_fmt='parquet',output_name_prefix='filt'):
         """
         Parameters: lower_threshold: int (optional),default = 0
