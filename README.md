@@ -2,7 +2,7 @@
 SPARROW is a two part sequential algorithm for single cell resolution spatial transcriptomics data, requiring the sole input of an arrow/parquet file containing gene expression and spatial localisation arrays. It infers cell types and identifies microenvironment zones representing distinct cell neighborhood types in a unified framework, with superior performance compared to state-of-the-art methods.
 
 Below is the overarching logic flow of this repo.
-![alt text](https://github.com/oliviacamel/SPARROW/blob/main/doc/architecture.png)
+![alt text](https://github.com/peiyaozhao617/SPARROW/blob/main/doc/architecture.png)
 
 ## Dependency
 See requirements.txt for dependency.
