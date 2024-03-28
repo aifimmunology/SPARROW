@@ -29,7 +29,7 @@ class make_parquet:
         if input_format == "csv":
             self.load_csv_data(cell_by_gene,cell_meta)
         elif input_format == "Anndata":
-            self.load_anndata(cell_by_gene)
+            self.load_anndata(cell_by_gene,cell_meta)
     def read_dd(self,infile):
         _in=dd.read_table(infile,sep=',')
         _in=_in.rename(columns={_in.columns[0]:"cell"})
@@ -38,22 +38,28 @@ class make_parquet:
     def load_csv_data(self,cell_by_gene,cell_meta):
         self.cell_by_gene=self.read_dd(cell_by_gene)
         self.cell_meta=self.read_dd(cell_meta)
-    def load_anndata(self,cell_by_gene):
-        import anndata
-        self.anndata=anndata.read_h5ad(cell_by_gene)
-        self.cell_by_gene=pd.DataFrame(self.anndata.X,index=self.anndata.obs['cell'],columns=self.anndata.var_names)
-        self.cell_by_gene= dd.from_pandas(self.cell_by_gene,chunksize=10000,sort=False)
-        default_value = 0  # can set this to an appropriate value later
+    def load_anndata(self,cell_by_gene,cell_meta):
+        import scanpy as sc
+        adata=sc.read_10x_h5(cell_by_gene)
+        meta_data=pd.read_table(cell_meta,sep=',')
         meta_data_columns = ['x','y'] + ['min_x', 'min_y', 'max_x', 'max_y']
-        self.cell_meta = pd.DataFrame(index=self.anndata.obs['cell'])
-        for col in meta_data_columns:
-            if col in self.anndata.obs.columns:
-                self.cell_meta[col] = self.anndata.obs[col]
-            else:
-                # Set the default value if the column is missing
-                self.cell_meta[col] = default_value
-        self.cell_meta=dd.from_pandas(self.cell_meta,chunksize=10000,sort=False)
-
+        # Here we define cells with circles around the centroid
+        # that are scaled by the area of the cell
+        push_out_factor = np.sqrt(meta_data["cell_area"]/np.pi)
+        meta_data['x'] = meta_data['x_centroid']
+        meta_data['y'] = meta_data['y_centroid']
+        meta_data['min_x'] = meta_data['x_centroid'] - push_out_factor
+        meta_data['min_y'] = meta_data['y_centroid'] - push_out_factor
+        meta_data['max_x'] = meta_data['x_centroid'] + push_out_factor
+        meta_data['max_y'] = meta_data['y_centroid'] + push_out_factor
+        self.cell_by_gene=pd.DataFrame(np.array(adata.X.todense()),index=adata.obs.index,columns=adata.var.index)
+        self.cell_by_gene.index= self.cell_by_gene.index.rename('cell')
+        self.cell_by_gene=dd.from_pandas(self.cell_by_gene,chunksize=10000)
+        meta_data = meta_data.set_index(meta_data['cell_id'])
+        meta_data.index=meta_data.index.rename('cell')
+        meta_data=meta_data[meta_data_columns]
+        self.cell_meta=dd.from_pandas(meta_data,chunksize=10000)
+        
     def filt(self,lower_threshold=0,upper_threshold=300, output_name='filt/',output_fmt='parquet',output_name_prefix='filt'):
         """
         Parameters: lower_threshold: int (optional),default = 0
