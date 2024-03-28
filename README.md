@@ -1,5 +1,5 @@
 # Overview of SPARROW
-SPARROW is a two part sequential algorithm for single cell resolution spatial transcriptomics data, requiring the sole input of an arrow/parquet file containing gene expression and spatial localisation arrays. It infers cell types and identifies microenvironment zones representing distinct cell neighborhood types in a unified framework, with superior performance compared to state-of-the-art methods.
+SPARROW is a computational framework that performs integrative cell type inference and microenvironment zone delineation with superior performance compared to state-of-the-art methods and is capable of predicting microenvironment zones for cells lacking spatial context such as those in scRNA-seq. It requires the sole input of an arrow/parquet file containing gene expression and spatial localisation arrays. The manuscript describing the design and adantages of SPARROW can be found here: 
 
 Below is the overarching logic flow of this repo.
 ![alt text](https://github.com/peiyaozhao617/SPARROW/blob/main/doc/architecture.png)
@@ -8,32 +8,15 @@ Below is the overarching logic flow of this repo.
 See requirements.txt for dependency.
 
 ## Quickstart
+### Install and setup
+Follow 01_Install_and_Setup.ipynb notebook for setting up the proper environment for SPARROW.
 ### ingest data, make parquet file and write metrics
-The `preprocessing` step is designed to ingest output files from various spatial transcriptomics platforms. The required files are 
+Follow 02_Data_Ingest_to_Make_Parquet.ipynb notebook for data ingestion steps. Examples on merFISH (Vizgen) and Xenium ingestion were given.
+In brief, the required files are
 1. a cell x gene matrix containing transcript counts of cells
 2. a cell metadata file containing the bounding spatial coordinates for each cell, named 'x_min','x_max','y_min' and 'y_max', and the centroids of cells, named 'x' and 'y'. 
-`preprocessing` can also accept an anndata file, in which the `obs` dataframe contains columns labelled `cell`, `x` and `y`, which are cell names and their corresponding spatial centroid coordinates. Additionally, this step also performs some basic data regulization procedures, for instance, the removal of cells with exceptionally low transcript levels, as these are likely to represent noise in the data. 
+Additionally, this step also performs some basic data cleanup procedures, for instance, the removal of cells with exceptionally low transcript levels, as these are likely to represent noise in the data. 
 
-To load and run as a module, follow the steps below:
-```python
-from SPARROW import preprocessing
-#Define the path to your cell-by-gene matrix and cell metadata files
-cell_by_gene_path = '/path/to/cell_by_gene_matrix.csv'
-cell_metadata_path = '/path/to/cell_metadata.csv'
-# Alternatively, for anndata format:
-anndata_path = '/path/to/your_anndata_file.h5ad'
-
-#accepted formats are {'Csv','Anndata'}
-# Initiate the preprocessing routine
-# For CSV format:
-obj=preprocessing.ingest.make_parquet(cell_by_gene=cell_by_gene_path,cell_meta=cell_metadata_path)  
-#if Anndata
-obj=preprocessing.ingest.make_parquet(cell_by_gene=anndata_path,input_format='Anndata')
-#filter out bad cells containing low numbers of transcripts, which likely represent noise in the data. If no filtering is needed, set threshold=0
-obj.filt(lower_threshold=0,upper_threshold=300,output_name='/path/to/parquet',output_fmt='parquet',output_name_prefix='prefix_to_parquet')
-#write metrics to a file named metric.txt
-obj.write_metric(output_name='metric.txt')
-```
 ### use SPARROW-VAE for cell typing
 The `vae` module within SPARROW facilitates cell type inference, in both supervised and unsupervised modes.
 #### Example 1: Supervised mode with labelled scRNA-seq data
