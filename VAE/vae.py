@@ -23,6 +23,184 @@ epsilon = 1e-9
 clamp_min = probs_to_logits(torch.tensor(torch.finfo(torch.float32).tiny, dtype=torch.float32))
 clamp_max=torch.tensor(16.00)
 
+class vae2(nn.Module):
+
+    def __init__(self, K, M, hidden_dim_vec_K , hidden_dim_vec, logits):
+        """
+        Variational Autoencoder (VAE) for cell type inference in spatial transcriptomics.
+
+        Parameters:
+            K (int): Dimensionality of the meaningful gene features in the scRNA-seq .
+            M (int): Dimensionality for a subset of genes or reduced gene panel.
+            hidden_dim_vec (list of int): Hidden layer dimensions for the encoder and decoder.
+            logits (list of int): Dimensions for cell type logits.
+        """
+        assert hidden_dim_vec_K[-1]  ==  hidden_dim_vec[-1]
+        self.K = K
+        self.M = M
+        self.latent_dim=hidden_dim_vec[-1]
+        self.celltype_fine=logits[-1]
+        super().__init__()
+        
+        
+        #encoding X as latent representation Z
+        encoding_layersK=[nn.Linear(self.K,hidden_dim_vec_K[0]),nn.Dropout(p=0.1), nn.BatchNorm1d(hidden_dim_vec_K[0]),nn.ReLU()]
+        for dim1, dim2 in zip (hidden_dim_vec_K[:-1], hidden_dim_vec_K[1:-1] ) : 
+            encoding_layersK.append(nn.Linear(dim1,dim2))
+            encoding_layersK.append(nn.Dropout(p=0.1))
+            encoding_layersK.append(nn.BatchNorm1d( dim2))
+            encoding_layersK.append(nn.ReLU())  
+        encoding_layersK.append(nn.Linear(hidden_dim_vec_K[-2],hidden_dim_vec_K[-1] * 2))
+        encoding_layersK.append(nn.Dropout(p=0.1))
+        encoding_layersK.append(nn.BatchNorm1d( hidden_dim_vec_K[-1] * 2))
+        self.encoderK = nn.Sequential(*encoding_layersK)
+        
+        #encoding X as latent representation Z
+        encoding_layers=[nn.Linear(M,hidden_dim_vec[0]),nn.Dropout(p=0.1), nn.BatchNorm1d(hidden_dim_vec[0]),nn.ReLU()]
+        for dim1, dim2 in zip (hidden_dim_vec[:-1], hidden_dim_vec[1:-1] ) : 
+            encoding_layers.append(nn.Linear(dim1,dim2))
+            encoding_layers.append(nn.Dropout(p=0.1))
+            encoding_layers.append(nn.BatchNorm1d( dim2))
+            encoding_layers.append(nn.ReLU())  
+        encoding_layers.append(nn.Linear(hidden_dim_vec[-2],hidden_dim_vec[-1] * 2))
+        encoding_layers.append(nn.Dropout(p=0.1))
+        encoding_layers.append(nn.BatchNorm1d( hidden_dim_vec[-1] * 2))
+        self.encoder = nn.Sequential(*encoding_layers)
+        
+        #decoding X_hat 
+        decoding_layers=[]
+        for dim1, dim2 in zip (hidden_dim_vec[::-1], hidden_dim_vec[::-1][1:] ) : 
+            decoding_layers.append(nn.Linear(dim1,dim2))
+            decoding_layers.append(nn.Dropout(p=0.1))
+            decoding_layers.append(nn.BatchNorm1d( dim2))
+            decoding_layers.append(nn.ReLU())        
+        decoding_layers.append(nn.Linear(hidden_dim_vec[0],M*2))
+        decoding_layers.append(nn.Dropout(p=0.1))
+        decoding_layers.append(nn.BatchNorm1d( M*2))
+        self.decoder=nn.Sequential(*decoding_layers)
+        
+        #representing Z as cell type logits
+        encoding_logit_layers=[nn.Linear(hidden_dim_vec[-1],logits[0]),nn.Dropout(p=0.1), nn.BatchNorm1d(logits[0]),nn.ReLU()]
+        for dim1, dim2 in zip(logits[:-1],logits[1:-1]):
+            encoding_logit_layers.append(nn.Linear(dim1,dim2))
+            encoding_logit_layers.append(nn.Dropout(p=0.1))
+            encoding_logit_layers.append(nn.BatchNorm1d( dim2))
+            encoding_logit_layers.append(nn.ReLU())
+        encoding_logit_layers.append(nn.Linear(logits[-2],logits[-1]*2))
+        encoding_logit_layers.append(nn.Dropout(p=0.1))
+        encoding_logit_layers.append(nn.BatchNorm1d(logits[-1]*2))
+        self.encoding_logits=nn.Sequential(*encoding_logit_layers)
+        
+        #decoding cell type logits as Z
+        decoding_logits_layers=[]
+        for dim1, dim2 in zip(logits[::-1],logits[::-1][1:]):
+            decoding_logits_layers.append(nn.Linear(dim1,dim2))
+            decoding_logits_layers.append(nn.Dropout(p=0.1))
+            decoding_logits_layers.append(nn.BatchNorm1d( dim2))
+            decoding_logits_layers.append(nn.ReLU())
+        decoding_logits_layers.append(nn.Linear(logits[0],hidden_dim_vec[-1]*2))
+        decoding_logits_layers.append(nn.Dropout(p=0.1))
+        decoding_logits_layers.append(nn.BatchNorm1d( hidden_dim_vec[-1]*2))
+        self.decoding_logits=nn.Sequential(*decoding_logits_layers)
+        
+    def Encoder(self, X, useK= False):
+        """
+        Encoder function for the mean and scale of the latent representation Z.
+
+        Parameters:
+            X (torch.Tensor): Input cell by gene matrix.
+    
+        Returns:
+            tuple: Mean and scale of the latent representation.
+
+        """
+        if useK:
+            encodedK=self.encoderK(X[:,:self.K])
+            encoded=self.encoder(X[:,self.K:])
+            encoded=(encodedK + encoded) / 2 
+            
+        else:
+            encoded=self.encoder(X)
+        loc,scale=torch.split(encoded,encoded.shape[1]//2,dim=-1)
+        scale=softplus(scale) +epsilon
+        return loc, scale
+    def Decoder(self, X):
+        """
+        Decoder function for parameterising X_hat from the latent representation.
+        
+        Parameters:
+            X (torch.Tensor): Latent representation.
+        
+        Returns:
+            tuple: logits to parameterisze zero inflated negative binomial distr.
+        
+        """
+        decoded=self.decoder(X)
+        gate_logits,nb_logits=torch.split(decoded,decoded.shape[1]//2,dim=-1)
+        gate_logits=torch.clamp(gate_logits,min=clamp_min,max=clamp_max)
+        nb_logits=torch.clamp(nb_logits,min=clamp_min,max=clamp_max)
+        return gate_logits, nb_logits
+    
+    def Encoder_logits(self,X):
+        
+        encoded=self.encoding_logits(X)
+        loc,scale=torch.split(encoded,encoded.shape[1]//2,dim=-1)
+        scale=softplus(scale) + epsilon
+        return loc, scale
+    def Decoder_logits(self,X):
+        decoded=self.decoding_logits(X)
+        loc,scale=torch.split(decoded,decoded.shape[1]//2,dim=-1)
+        scale=softplus(scale) +epsilon
+        return loc, scale
+    
+    #posterior q(z|x)
+    def guide (self,X=None,X_prime=None,L=None,class_weights=None):
+        pyro.module("vae",self)
+        if X is not None:
+            with pyro.plate("x", X.shape[0]) : 
+                with poutine.scale(scale=1/X.shape[0]):
+                    loc, scale=self.Encoder(X,useK=True)
+                    encoded=pyro.sample("z", dist.Normal(loc,scale).to_event(1))
+                    loc,scale=self.Encoder_logits(encoded)
+                    logits_x=pyro.sample('logits_x',dist.Normal(loc, scale).to_event(1))
+        if X_prime is not None:
+            with pyro.plate("xp",X_prime.shape[0]):
+                with poutine.scale(scale=1/X_prime.shape[0]):
+                    loc, scale=self.Encoder(X_prime)
+                    encoded=pyro.sample("z_prime", dist.Normal(loc,scale).to_event(1))
+                    loc,scale=self.Encoder_logits(encoded)
+                    logits_xprime=pyro.sample("logits_xprime", dist.Normal(loc,scale).to_event(1))
+    #p(x|z)
+    def model(self,X=None,X_prime=None,L=None,class_weights=None):
+        pyro.module("vae",self)
+        if X is not None:
+            theta_x=pyro.param("theta_x", 2* torch.ones(self.M),constraint=constraints.positive)
+            with pyro.plate("x", X.shape[0]) : 
+                with poutine.scale(scale=1/X.shape[0]):
+                    loc,scale=X.new_zeros(torch.Size((X.shape[0],self.celltype_fine))), X.new_ones(torch.Size((X.shape[0],self.celltype_fine)))
+                    logits_x=pyro.sample('logits_x',dist.Normal(loc, scale).to_event(1))
+                    if class_weights is not None:
+                        rebalanced_logits = logits_x * class_weights
+                    else:
+                        rebalanced_logits = logits_x 
+                    if L is not None:
+                        pyro.sample("L", dist.Categorical(logits=rebalanced_logits).to_event(1), obs=L) 
+                    loc,scale=X.new_zeros(torch.Size((X.shape[0],self.latent_dim))), X.new_ones(torch.Size((X.shape[0],self.latent_dim)))
+                    encoded=pyro.sample('z',dist.Normal(loc, scale).to_event(1))               
+                    gate_logits,nb_logits=self.Decoder(encoded)
+                    x_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_x)
+                    xhat=pyro.sample('xhat',x_dist.to_event(1),obs=X[:,self.K:].type(torch.LongTensor))
+        if X_prime is not None:
+            theta_prime=pyro.param("theta_x_prime", 2 * torch.ones(X_prime.shape[1]),constraint=constraints.positive)
+            with pyro.plate("xp", X_prime.shape[0]) : 
+                with poutine.scale(scale=1/X_prime.shape[0]):
+                    loc,scale=X_prime.new_zeros(torch.Size((X_prime.shape[0],self.celltype_fine))), X_prime.new_ones(torch.Size((X_prime.shape[0],self.celltype_fine)))
+                    logits_xprime=pyro.sample('logits_xprime',dist.Normal(loc, scale).to_event(1))
+                    loc,scale=X_prime.new_zeros(torch.Size((X_prime.shape[0],self.latent_dim))), X_prime.new_ones(torch.Size((X_prime.shape[0],self.latent_dim)))            
+                    encoded=pyro.sample('z_prime', dist.Normal(loc, scale).to_event(1))                
+                    gate_logits,nb_logits=self.Decoder(encoded)
+                    xprime_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_prime)
+                    xprime_hat=pyro.sample('xphat',xprime_dist.to_event(1),obs=X_prime.type(torch.LongTensor)) 
 
 class vae(nn.Module):
 
@@ -345,6 +523,7 @@ def _save_label_encoder(label_encoder, output_path):
     label_encoder_dict = {k: str(v) for k, v in zip(label_encoder.classes_, np.arange(len(label_encoder.classes_)))}
     with open(os.path.join(output_path, 'label_encoder.json'), 'w') as f:
         json.dump(label_encoder_dict, f)
+
         
 def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,log_name='training.log', weighted_training=False, write=False, output_name='vae_model.pkl', **kwargs):
     '''
