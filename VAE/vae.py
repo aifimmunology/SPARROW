@@ -23,6 +23,11 @@ epsilon = 1e-9
 clamp_min = probs_to_logits(torch.tensor(torch.finfo(torch.float32).tiny, dtype=torch.float32))
 clamp_max=torch.tensor(16.00)
 
+import torch
+
+
+
+
 class vae2(nn.Module):
 
     def __init__(self, K, M, hidden_dim_vec_K , hidden_dim_vec, logits):
@@ -30,7 +35,7 @@ class vae2(nn.Module):
         Variational Autoencoder (VAE) for cell type inference in spatial transcriptomics.
 
         Parameters:
-            K (int): Dimensionality of the meaningful gene features in the scRNA-seq .
+            K (int): Dimensionality of meaningful gene features in the scRNA-seq other than those that are included in the gene panel.
             M (int): Dimensionality for a subset of genes or reduced gene panel.
             hidden_dim_vec (list of int): Hidden layer dimensions for the encoder and decoder.
             logits (list of int): Dimensions for cell type logits.
@@ -79,6 +84,18 @@ class vae2(nn.Module):
         decoding_layers.append(nn.BatchNorm1d( M*2))
         self.decoder=nn.Sequential(*decoding_layers)
         
+        #decoding X'_hat 
+        decoding_layersK=[]
+        for dim1, dim2 in zip (hidden_dim_vec_K[::-1], hidden_dim_vec_K[::-1][1:] ) : 
+            decoding_layersK.append(nn.Linear(dim1,dim2))
+            decoding_layersK.append(nn.Dropout(p=0.1))
+            decoding_layersK.append(nn.BatchNorm1d( dim2))
+            decoding_layersK.append(nn.ReLU())        
+        decoding_layersK.append(nn.Linear(hidden_dim_vec_K[0],K*2))
+        decoding_layersK.append(nn.Dropout(p=0.1))
+        decoding_layersK.append(nn.BatchNorm1d( K*2))
+        self.decoderK=nn.Sequential(*decoding_layersK)
+        
         #representing Z as cell type logits
         encoding_logit_layers=[nn.Linear(hidden_dim_vec[-1],logits[0]),nn.Dropout(p=0.1), nn.BatchNorm1d(logits[0]),nn.ReLU()]
         for dim1, dim2 in zip(logits[:-1],logits[1:-1]):
@@ -115,21 +132,21 @@ class vae2(nn.Module):
 
         """
         if useK:
-            encodedK=self.encoderK(X[:,:self.K])
-            encoded=self.encoder(X[:,self.K:])
-            encoded=(encodedK + encoded) / 2 
+            encoded=self.encoderK(X)
             
         else:
             encoded=self.encoder(X)
         loc,scale=torch.split(encoded,encoded.shape[1]//2,dim=-1)
         scale=softplus(scale) +epsilon
         return loc, scale
-    def Decoder(self, X):
+    
+    def Decoder(self, X,useK=False):
         """
         Decoder function for parameterising X_hat from the latent representation.
         
         Parameters:
             X (torch.Tensor): Latent representation.
+            useK (bool): Flag to use decoderK for additional decoding for scRNA-seq, defaults to False.
         
         Returns:
             tuple: logits to parameterisze zero inflated negative binomial distr.
@@ -139,6 +156,14 @@ class vae2(nn.Module):
         gate_logits,nb_logits=torch.split(decoded,decoded.shape[1]//2,dim=-1)
         gate_logits=torch.clamp(gate_logits,min=clamp_min,max=clamp_max)
         nb_logits=torch.clamp(nb_logits,min=clamp_min,max=clamp_max)
+        if useK:
+            decodedK=self.decoderK(X)
+            gate_logitsK,nb_logitsK=torch.split(decodedK,decodedK.shape[1]//2,dim=-1)
+            gate_logitsK=torch.clamp(gate_logitsK,min=clamp_min,max=clamp_max)
+            nb_logitsK=torch.clamp(nb_logitsK,min=clamp_min,max=clamp_max)
+            gate_logits = gate_logitsK
+            nb_logits = nb_logitsK
+        
         return gate_logits, nb_logits
     
     def Encoder_logits(self,X):
@@ -159,22 +184,29 @@ class vae2(nn.Module):
         if X is not None:
             with pyro.plate("x", X.shape[0]) : 
                 with poutine.scale(scale=1/X.shape[0]):
-                    loc, scale=self.Encoder(X,useK=True)
+                    loc, scale=self.Encoder(X[:,self.K:],useK=False)
                     encoded=pyro.sample("z", dist.Normal(loc,scale).to_event(1))
-                    loc,scale=self.Encoder_logits(encoded)
-                    logits_x=pyro.sample('logits_x',dist.Normal(loc, scale).to_event(1))
+                    _loc, _scale=self.Encoder(X[:,:self.K],useK=True)
+                    #D = torch.norm(loc - _loc, p=2)
+                   # pyro.factor("D", -D,has_rsample=False)  
+
+                    encodedLong=pyro.sample("zlong", dist.Normal(_loc,_scale).to_event(1))
+                    _loc,_scale=self.Encoder_logits((encoded+encodedLong) / 2 )
+                    logits_x=pyro.sample('logits_x',dist.Normal(_loc, _scale).to_event(1))
         if X_prime is not None:
             with pyro.plate("xp",X_prime.shape[0]):
                 with poutine.scale(scale=1/X_prime.shape[0]):
-                    loc, scale=self.Encoder(X_prime)
-                    encoded=pyro.sample("z_prime", dist.Normal(loc,scale).to_event(1))
-                    loc,scale=self.Encoder_logits(encoded)
-                    logits_xprime=pyro.sample("logits_xprime", dist.Normal(loc,scale).to_event(1))
-    #p(x|z)
+                    loc_prime, scale_prime=self.Encoder(X_prime)
+                    encoded=pyro.sample("z_prime", dist.Normal(loc_prime,scale_prime).to_event(1))
+                    _loc,_scale=self.Encoder_logits(encoded)
+                    logits_prime=pyro.sample("logits_xprime", dist.Normal(_loc,_scale).to_event(1))
+
+                                    
     def model(self,X=None,X_prime=None,L=None,class_weights=None):
         pyro.module("vae",self)
         if X is not None:
-            theta_x=pyro.param("theta_x", 2* torch.ones(self.M),constraint=constraints.positive)
+            theta_xK=pyro.param("theta_xK", 2* torch.ones(self.K),constraint=constraints.positive)
+            theta_x=pyro.param("theta_x", 2* torch.ones(self.M ),constraint=constraints.positive)
             with pyro.plate("x", X.shape[0]) : 
                 with poutine.scale(scale=1/X.shape[0]):
                     loc,scale=X.new_zeros(torch.Size((X.shape[0],self.celltype_fine))), X.new_ones(torch.Size((X.shape[0],self.celltype_fine)))
@@ -187,11 +219,16 @@ class vae2(nn.Module):
                         pyro.sample("L", dist.Categorical(logits=rebalanced_logits).to_event(1), obs=L) 
                     loc,scale=X.new_zeros(torch.Size((X.shape[0],self.latent_dim))), X.new_ones(torch.Size((X.shape[0],self.latent_dim)))
                     encoded=pyro.sample('z',dist.Normal(loc, scale).to_event(1))               
-                    gate_logits,nb_logits=self.Decoder(encoded)
+                    gate_logits,nb_logits=self.Decoder(encoded,useK=False)
                     x_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_x)
-                    xhat=pyro.sample('xhat',x_dist.to_event(1),obs=X[:,self.K:].type(torch.LongTensor))
+                    xhat=pyro.sample('xhatshort',x_dist.to_event(1),obs=X[:,self.K:].type(torch.LongTensor))
+                    encoded=pyro.sample('zlong',dist.Normal(loc, scale).to_event(1))             
+                    gate_logits,nb_logits=self.Decoder(encoded,useK=True)
+                    x_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_xK)
+                    xhat=pyro.sample('xhatlong',x_dist.to_event(1),obs=X[:,:self.K].type(torch.LongTensor))
+                                        
         if X_prime is not None:
-            theta_prime=pyro.param("theta_x_prime", 2 * torch.ones(X_prime.shape[1]),constraint=constraints.positive)
+            theta_prime=pyro.param("theta_x_prime", 2 *  torch.ones(self.M) ,constraint=constraints.positive)
             with pyro.plate("xp", X_prime.shape[0]) : 
                 with poutine.scale(scale=1/X_prime.shape[0]):
                     loc,scale=X_prime.new_zeros(torch.Size((X_prime.shape[0],self.celltype_fine))), X_prime.new_ones(torch.Size((X_prime.shape[0],self.celltype_fine)))
@@ -335,7 +372,6 @@ class vae(nn.Module):
         pyro.module("vae",self)
         if X is not None:
             theta_x=pyro.param("theta_x", 2* torch.ones(X.shape[1]),constraint=constraints.positive)
-
             with pyro.plate("x", X.shape[0]) : 
                 with poutine.scale(scale=1/X.shape[0]):
                     loc,scale=X.new_zeros(torch.Size((X.shape[0],self.celltype_fine))), X.new_ones(torch.Size((X.shape[0],self.celltype_fine)))
@@ -560,6 +596,7 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
 
     # Handling different data scenarios
     dataset = dataloader.Dataloader(X, X_prime, label)
+    print ('loading data')
     if sampling:
         balanced_sampler = dataloader.BalancedSampler(label) if label is not None else None
         data_loader = DataLoader(dataset, sampler=balanced_sampler, batch_size=kwargs.get('batch_size', 10000),shuffle=False)
@@ -572,14 +609,18 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
     else:
         class_weights = None
     # Training loop
+    print ('start training')
+    print (len(data_loader))
     for epoch in range(num_epochs):
         total_loss = 0.0       
         for batch in data_loader:
+            print (total_loss)
             if len(batch)==3:
                 X,X_prime,label=batch
-                loss=svi.step(X=None,X_prime=X,L=None,class_weights=class_weights)
-                loss=svi.step(X=X_prime,X_prime=X,L=None,class_weights=class_weights)
+                #loss=svi.step(X=None,X_prime=X,L=None,class_weights=class_weights)
+                #loss=svi.step(X=X_prime,X_prime=X,L=None,class_weights=class_weights)
                 loss=svi.step(X=X_prime,X_prime=X, L=label,class_weights=class_weights) #for historical reasons, X and X prime here are inverted
+                print (loss)
             elif len(batch)==2:
                 X,label=batch
                 loss=svi.step(X=X,X_prime=None,L=None,class_weights=class_weights)
@@ -589,6 +630,7 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
                 loss=svi.step(X=X,X_prime=None,L=None,class_weights=class_weights)
             total_loss+=loss
         avg_loss =total_loss/len(data_loader)
+        print ('avg_loss',avg_loss)
         logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
     # Save the model if required
     if write:
