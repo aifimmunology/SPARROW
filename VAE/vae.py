@@ -37,6 +37,7 @@ class vae2(nn.Module):
         Parameters:
             K (int): Dimensionality of meaningful gene features in the scRNA-seq other than those that are included in the gene panel.
             M (int): Dimensionality for a subset of genes or reduced gene panel.
+            hidden_dim_vec_K (list of int): Hidden layer dimensions for the encoder and decoder for X'.
             hidden_dim_vec (list of int): Hidden layer dimensions for the encoder and decoder.
             logits (list of int): Dimensions for cell type logits.
         """
@@ -610,17 +611,14 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
         class_weights = None
     # Training loop
     print ('start training')
-    print (len(data_loader))
     for epoch in range(num_epochs):
         total_loss = 0.0       
         for batch in data_loader:
-            print (total_loss)
             if len(batch)==3:
                 X,X_prime,label=batch
                 #loss=svi.step(X=None,X_prime=X,L=None,class_weights=class_weights)
                 #loss=svi.step(X=X_prime,X_prime=X,L=None,class_weights=class_weights)
                 loss=svi.step(X=X_prime,X_prime=X, L=label,class_weights=class_weights) #for historical reasons, X and X prime here are inverted
-                print (loss)
             elif len(batch)==2:
                 X,label=batch
                 loss=svi.step(X=X,X_prime=None,L=None,class_weights=class_weights)
@@ -630,7 +628,6 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
                 loss=svi.step(X=X,X_prime=None,L=None,class_weights=class_weights)
             total_loss+=loss
         avg_loss =total_loss/len(data_loader)
-        print ('avg_loss',avg_loss)
         logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
     # Save the model if required
     if write:
