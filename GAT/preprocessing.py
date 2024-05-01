@@ -83,6 +83,29 @@ def calculate_w(geopandas_df,w_method='knn',**kwargs):
     w.transform='R'
     return(w)
 
+def _make_A(gdf,k,w_method='knn'):
+    '''
+    Parameters:
+        gdf:  geopandas.geodataframe.GeoDataFrame
+            dataframe containing a geometry column
+        k_neighbours: int
+            Number of neighbors for spatial weight calculation.
+        w_method: str, optional
+            Method to calculate weights; defaults to 'knn'.
+
+    Returns:
+        A:torch.sparse.FloatTensor
+        Normalized adjacency matrix.
+        
+    '''
+    spatial_weight=calculate_w(gdf,
+                               w_method='knn',
+                               k=k)
+    _sparse_adj_mat=create_sparse_adj_matrix(spatial_weight.sparse)
+    D=compute_sparse_degree_matrix(_sparse_adj_mat)
+    A=normalize_adjacency(_sparse_adj_mat,D)
+    A=convert_scipy_csr_to_sparse_tensor(A)
+    return A
 
 def graph_loader(obj,genes,x0,x1,y0,y1,stepsize,k_neighbours,min_sum=5, **kwargs):
     '''
@@ -100,14 +123,16 @@ def graph_loader(obj,genes,x0,x1,y0,y1,stepsize,k_neighbours,min_sum=5, **kwargs
         stepsize:
             step size for tiling over the spatial area
         k_neighbours: int
-            number of neighbours for spatial weight calculation
+            Number of neighbors for spatial weight calculation.
+        min_sum: int, optional
+            Minimum sum of transcripts threshold for selecting training cells; defaults to 5.
         **kwargs: Additional keyword arguments.
             
     Returns:
         A_list: 
             list of normalised adjacency matrices
         X_list:list of torch.Tensor
-            list of cell by gene tensors to be fed into SPARROW VAE to get latent representations Z for.
+            list of cell by gene tensors to be fed into SPARROW VAE to get latent representations Z for node features.
             
     '''
     if isinstance(genes, str):
@@ -123,11 +148,6 @@ def graph_loader(obj,genes,x0,x1,y0,y1,stepsize,k_neighbours,min_sum=5, **kwargs
             selected_training_cells=selected_training_cells[selected_training_cells.sum(axis=1) >=min_sum]
             if len(selected_training_cells) > kwargs.get('min_length',3000): #this is an arbitrary number just so edges with disturbed structures aren't included in training
                 X_list.append(torch.from_numpy(selected_training_cells.values).type(torch.float))
-                spatial_weight=calculate_w(obj.geometry.loc[ selected_training_cells.index],
-                                           w_method='knn',
-                                           k=k_neighbours)
-                _sparse_adj_mat=create_sparse_adj_matrix(spatial_weight.sparse)
-                D=compute_sparse_degree_matrix(_sparse_adj_mat)
-                A=normalize_adjacency(_sparse_adj_mat,D)
-                A_list.append( convert_scipy_csr_to_sparse_tensor(A))
+                A=_make_A(obj.geometry.loc[ selected_training_cells.index], k_neighbours,kwargs.get('w_method','knn'))
+                A_list.append( A)
     return A_list,X_list
