@@ -616,8 +616,8 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
         for batch in data_loader:
             if len(batch)==3:
                 X,X_prime,label=batch
-                #loss=svi.step(X=None,X_prime=X,L=None,class_weights=class_weights)
-                #loss=svi.step(X=X_prime,X_prime=X,L=None,class_weights=class_weights)
+                loss=svi.step(X=None,X_prime=X,L=None,class_weights=class_weights)
+                loss=svi.step(X=X_prime,X_prime=X,L=None,class_weights=class_weights)
                 loss=svi.step(X=X_prime,X_prime=X, L=label,class_weights=class_weights) #for historical reasons, X and X prime here are inverted
             elif len(batch)==2:
                 X,label=batch
