@@ -6,7 +6,6 @@ Below is the overarching logic flow of this repo.
 
 ## Dependency
 See requirements.txt for dependency.
-
 ## Quickstart
 ### Install and setup
 Follow 01_Install_and_Setup.ipynb notebook for setting up the proper environment for SPARROW.
