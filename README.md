@@ -1,5 +1,6 @@
 # Overview of SPARROW
-SPARROW is a computational framework that performs integrative cell type inference and microenvironment zone delineation with superior performance compared to state-of-the-art methods and is capable of predicting microenvironment zones for cells lacking spatial context such as those in scRNA-seq. It requires the sole input of an arrow/parquet file containing gene expression and spatial localisation arrays. The manuscript describing the design and adantages of SPARROW can be found here: 
+SPARROW is a computational framework that performs integrative cell type inference and microenvironment zone delineation with superior performance compared to state-of-the-art methods and is capable of predicting microenvironment zones for cells lacking spatial context such as those in scRNA-seq. It requires the sole input of an arrow/parquet file containing gene expression and spatial localisation arrays. The manuscript describing the design and advantages of SPARROW can be found here: 
+https://www.biorxiv.org/content/10.1101/2024.04.05.588159v1.full.pdf
 
 Below is the overarching logic flow of this repo.
 ![alt text](https://github.com/peiyaozhao617/SPARROW/blob/main/doc/architecture.png)
