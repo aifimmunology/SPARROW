@@ -35,7 +35,6 @@ dependencies:
   - backports.functools_lru_cache=1.6.4=pyhd8ed1ab_0
   - beautifulsoup4=4.11.1=pyha770c72_0
   - blosc=1.21.1=h83bc5f7_3
-  - bokeh=3.0.2=pyhd8ed1ab_0
   - boost-cpp=1.78.0=h75c5d50_1
   - brotli=1.0.9=h166bdaf_8
   - brotli-bin=1.0.9=h166bdaf_8
