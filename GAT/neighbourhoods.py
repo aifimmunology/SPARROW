@@ -61,9 +61,14 @@ class minCUTPooling(nn.Module):
             
         return outputs
 
+def _loss_smo(embedding,edge_index):
+    
+    #add a smoothness penalty term to penalize differences between H_i and H_i+1
+    delta = embedding[edge_index[0]] - embedding[edge_index[1]]
+    return torch.sum (torch.norm (delta,p=2, dim=1))
 
 
-def train(GATmodel,VAEmodel, optimizer_gat, A_list, X_list ,num_epochs=200,log_name='GATtraining.log', **kwargs):
+def train(GATmodel,VAEmodel, optimizer_gat, A_list, X_list ,num_epochs=200,log_name='GATtraining.log', alpha = 1e-6 , **kwargs):
     """
     Training function for the GAT model.
 
@@ -75,6 +80,7 @@ def train(GATmodel,VAEmodel, optimizer_gat, A_list, X_list ,num_epochs=200,log_n
         X_list (list): List of VAE latent representation Z tensors.
         num_epochs (int): Number of training epochs.
         log_name (str): Log file name.
+        alpha (float): Weight for the smoothness penalty term.
         **kwargs: Additional arguments.
     """
     VAEmodel.eval()
@@ -91,7 +97,7 @@ def train(GATmodel,VAEmodel, optimizer_gat, A_list, X_list ,num_epochs=200,log_n
                 loss = 0 
                 for embedding in embeddings:
                     x, adj, lc, lo = dense.dense_mincut_pool(loc, A.to_dense(), embedding)
-                    loss += (lc + lo)
+                    loss += (lc + lo + alpha * _loss_smo(embedding,  A.coalesce().indices() )) 
                 loss.backward()
                 total_loss += loss.item()
                 optimizer_gat.step()
