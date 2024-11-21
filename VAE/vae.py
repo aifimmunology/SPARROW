@@ -2,6 +2,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.functional import softplus
 from torch.distributions import constraints
 import pyro
@@ -23,7 +24,28 @@ epsilon = 1e-9
 clamp_min = probs_to_logits(torch.tensor(torch.finfo(torch.float32).tiny, dtype=torch.float32))
 clamp_max=torch.tensor(16.00)
 
-import torch
+class MINE(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super(MINE, self).__init__()
+        self.fc1 = nn.Linear(input_dim * 2, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc3 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, z, z_prime):
+        """
+        Compute T(z, z_prime) for Mutual Information Estimation.
+        
+        Parameters:
+            z (torch.Tensor): Latent representation 1 (Z).
+            z_prime (torch.Tensor): Latent representation 2 (Z').
+        
+        Returns:
+            torch.Tensor: Estimated mutual information between z and z_prime.
+        """
+        z_concat = torch.cat([z, z_prime], dim=-1)  # Concatenate z and z_prime
+        h = F.relu(self.fc1(z_concat))
+        h = F.relu(self.fc2(h))
+        return self.fc3(h)
 
 
 
@@ -188,8 +210,7 @@ class vae2(nn.Module):
                     loc, scale=self.Encoder(X[:,self.K:],useK=False)
                     encoded=pyro.sample("z", dist.Normal(loc,scale).to_event(1))
                     _loc, _scale=self.Encoder(X[:,:self.K],useK=True)
-                    #D = torch.norm(loc - _loc, p=2)
-                   # pyro.factor("D", -D,has_rsample=False)  
+
 
                     encodedLong=pyro.sample("zlong", dist.Normal(_loc,_scale).to_event(1))
                     _loc,_scale=self.Encoder_logits((encoded+encodedLong) / 2 )
@@ -240,9 +261,34 @@ class vae2(nn.Module):
                     xprime_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_prime)
                     xprime_hat=pyro.sample('xphat',xprime_dist.to_event(1),obs=X_prime.type(torch.LongTensor)) 
 
+class Attention(nn.Module):
+    def __init__(self, input_dim):
+        super(Attention, self).__init__()
+        self.attention_weights = nn.Linear(input_dim, input_dim)
+
+    def forward(self, x):
+        # Compute attention weights
+        weights = torch.sigmoid(self.attention_weights(x))
+        # Apply attention weights to the input
+        attended_x = x * weights
+        return attended_x, weights
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(self, input_dim, num_heads=4):
+        super(MultiHeadAttention, self).__init__()
+        self.num_heads = num_heads
+        self.attention_heads = nn.ModuleList([Attention(input_dim) for _ in range(num_heads)])
+    
+    def forward(self, x):
+        attended_outputs = []
+        for head in self.attention_heads:
+            attended_x, _ = head(x)
+            attended_outputs.append(attended_x)
+        return torch.mean(torch.stack(attended_outputs), dim=0)
+    
 class vae(nn.Module):
 
-    def __init__(self, M,hidden_dim_vec, logits):
+    def __init__(self, M,hidden_dim_vec, logits, beta = 0.5, heads = 1):
         """
         Variational Autoencoder (VAE) for cell type inference in spatial transcriptomics.
 
@@ -257,8 +303,14 @@ class vae(nn.Module):
         """
         self.latent_dim=hidden_dim_vec[-1]
         self.celltype_fine=logits[-1]
+        self.beta = beta
         super().__init__()
         
+        self.attention = MultiHeadAttention(M,num_heads = heads)
+        self.mine = MINE(self.latent_dim, hidden_dim_vec[-1])
+        self.clustering_layer = nn.Parameter(torch.Tensor(1, self.latent_dim))
+        nn.init.xavier_uniform_(self.clustering_layer.data)
+                
         #encoding X as latent representation Z
         encoding_layers=[nn.Linear(M,hidden_dim_vec[0]),nn.Dropout(p=0.1), nn.BatchNorm1d(hidden_dim_vec[0]),nn.ReLU()]
         for dim1, dim2 in zip (hidden_dim_vec[:-1], hidden_dim_vec[1:-1] ) : 
@@ -313,12 +365,14 @@ class vae(nn.Module):
 
         Parameters:
             X (torch.Tensor): Input cell by gene matrix.
-    
+            
         Returns:
             tuple: Mean and scale of the latent representation.
 
         """
-        encoded=self.encoder(X)
+        attended_X = self.attention(X)
+        
+        encoded=self.encoder(attended_X)
         loc,scale=torch.split(encoded,encoded.shape[1]//2,dim=-1)
         scale=softplus(scale) +epsilon
         return loc, scale
@@ -351,54 +405,113 @@ class vae(nn.Module):
         scale=softplus(scale) +epsilon
         return loc, scale
     
+    def clustering_loss(self, z, q):
+        p = self.target_distribution(q)
+        kl_div = torch.nn.functional.kl_div(q.log(), p, reduction='batchmean')
+        return kl_div
+
+    def target_distribution(self, q):
+        weight = q ** 2 / torch.sum(q, dim=0)
+        return (weight.t() / torch.sum(weight, dim=1)).t()
+
+    def cluster_assignments(self, z):
+        q = 1.0 / (1.0 + torch.sum((z.unsqueeze(1) - self.clustering_layer) ** 2, dim=2))
+        q = q / torch.sum(q, dim=1, keepdim=True)
+        return q
+    
+    def mmd_loss(self, z, z_prime, sigma=1.0):
+        """
+        Calculate MMD loss between z and z_prime.
+
+        Parameters:
+            z (torch.Tensor): Latent representation of X.
+            z_prime (torch.Tensor): Latent representation of X_prime.
+
+        Returns:
+            torch.Tensor: MMD loss.
+        """
+        def gaussian_kernel(x, y, sigma):
+            beta = 1.0 / (2.0 * sigma ** 2)
+            dist = torch.cdist(x, y, p=2.0)
+            k = torch.exp(-beta * dist ** 2)
+            return k
+
+        Kxx = gaussian_kernel(z, z, sigma)
+        Kyy = gaussian_kernel(z_prime, z_prime, sigma)
+        Kxy = gaussian_kernel(z, z_prime, sigma)
+
+        mmd = Kxx.mean() + Kyy.mean() - 2 * Kxy.mean()
+        return mmd
     #posterior q(z|x)
-    def guide (self,X=None,X_prime=None,L=None,class_weights=None):
+    def guide (self,X=None,X_prime=None,L=None,L_prime = None):
         pyro.module("vae",self)
         if X is not None:
             with pyro.plate("x", X.shape[0]) : 
-                with poutine.scale(scale=1/X.shape[0]):
-                    loc, scale=self.Encoder(X)
+                with poutine.scale(scale=self.beta):
+                    loc, scale=self.Encoder(X)                                   
                     encoded=pyro.sample("z", dist.Normal(loc,scale).to_event(1))
+                    
                     loc,scale=self.Encoder_logits(encoded)
                     logits_x=pyro.sample('logits_x',dist.Normal(loc, scale).to_event(1))
+                    #q = self.cluster_assignments(encoded)
+                    #clustering_loss = self.clustering_loss(encoded, q)
+                    #pyro.factor("clustering_loss", -clustering_loss,has_rsample=False)
+
+                                
         if X_prime is not None:
             with pyro.plate("xp",X_prime.shape[0]):
-                with poutine.scale(scale=1/X_prime.shape[0]):
+                with poutine.scale(scale=self.beta):
                     loc, scale=self.Encoder(X_prime)
-                    encoded=pyro.sample("z_prime", dist.Normal(loc,scale).to_event(1))
-                    loc,scale=self.Encoder_logits(encoded)
+                    encodedprime=pyro.sample("z_prime", dist.Normal(loc,scale).to_event(1))
+                    loc,scale=self.Encoder_logits(encodedprime)
                     logits_xprime=pyro.sample("logits_xprime", dist.Normal(loc,scale).to_event(1))
+                    if X is None:
+                        q = self.cluster_assignments(encodedprime)
+                        clustering_loss = self.clustering_loss(encodedprime, q)
+                        pyro.factor("clustering_loss_prime", -clustering_loss,has_rsample=False)
+        if X is not None and X_prime is not None:
+            mmd_loss_value = self.mmd_loss(encoded, encodedprime)
+            pyro.factor("mmd_loss", -mmd_loss_value, has_rsample=False)
+
     #p(x|z)
-    def model(self,X=None,X_prime=None,L=None,class_weights=None):
+    def model(self,X=None,X_prime=None,L=None, L_prime = None):
         pyro.module("vae",self)
         if X is not None:
             theta_x=pyro.param("theta_x", 2* torch.ones(X.shape[1]),constraint=constraints.positive)
             with pyro.plate("x", X.shape[0]) : 
-                with poutine.scale(scale=1/X.shape[0]):
+                with poutine.scale(scale=self.beta):
                     loc,scale=X.new_zeros(torch.Size((X.shape[0],self.celltype_fine))), X.new_ones(torch.Size((X.shape[0],self.celltype_fine)))
                     logits_x=pyro.sample('logits_x',dist.Normal(loc, scale).to_event(1))
-                    if class_weights is not None:
-                        rebalanced_logits = logits_x * class_weights
-                    else:
-                        rebalanced_logits = logits_x 
+
                     if L is not None:
-                        pyro.sample("L", dist.Categorical(logits=rebalanced_logits).to_event(1), obs=L) 
+                        pyro.sample("L", dist.Categorical(logits=logits_x).to_event(1), obs=L) 
+
                     loc,scale=X.new_zeros(torch.Size((X.shape[0],self.latent_dim))), X.new_ones(torch.Size((X.shape[0],self.latent_dim)))
-                    encoded=pyro.sample('z',dist.Normal(loc, scale).to_event(1))               
+
+                    encoded=pyro.sample('z',dist.Normal(loc, scale).to_event(1))   
+                    q = self.cluster_assignments(encoded)
+                    clustering_loss = self.clustering_loss(encoded, q)
                     gate_logits,nb_logits=self.Decoder(encoded)
                     x_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_x)
                     xhat=pyro.sample('xhat',x_dist.to_event(1),obs=X.type(torch.LongTensor))
         if X_prime is not None:
             theta_prime=pyro.param("theta_x_prime", 2 * torch.ones(X_prime.shape[1]),constraint=constraints.positive)
             with pyro.plate("xp", X_prime.shape[0]) : 
-                with poutine.scale(scale=1/X_prime.shape[0]):
+                with poutine.scale(scale=self.beta):
                     loc,scale=X_prime.new_zeros(torch.Size((X_prime.shape[0],self.celltype_fine))), X_prime.new_ones(torch.Size((X_prime.shape[0],self.celltype_fine)))
                     logits_xprime=pyro.sample('logits_xprime',dist.Normal(loc, scale).to_event(1))
+                    if L_prime is not None:
+                        pyro.sample("L_prime", dist.Categorical(logits=logits_xprime).to_event(1), obs=L_prime) 
+                   
                     loc,scale=X_prime.new_zeros(torch.Size((X_prime.shape[0],self.latent_dim))), X_prime.new_ones(torch.Size((X_prime.shape[0],self.latent_dim)))            
-                    encoded=pyro.sample('z_prime', dist.Normal(loc, scale).to_event(1))                
+                    encoded=pyro.sample('z_prime', dist.Normal(loc, scale).to_event(1))   
+                    q = self.cluster_assignments(encoded)
+                    clustering_loss = self.clustering_loss(encoded, q)  
+                    
                     gate_logits,nb_logits=self.Decoder(encoded)
                     xprime_dist = dist.ZeroInflatedNegativeBinomial(gate_logits=gate_logits,logits=nb_logits,total_count=theta_prime)
                     xprime_hat=pyro.sample('xphat',xprime_dist.to_event(1),obs=X_prime.type(torch.LongTensor)) 
+
                     
 def feature_selection(obj,genes=None,min_perc=0.05,var=0.5):
     '''
@@ -424,6 +537,8 @@ def feature_selection(obj,genes=None,min_perc=0.05,var=0.5):
         gene_counts = obj.parquet.loc[:, selected_genes].astype(bool).sum(axis=0).compute()
         selected_genes = [gene for gene in selected_genes if gene_counts[gene] / len(obj.parquet) > min_perc]
     return selected_genes
+
+
 
 def train_test_split(X,X_prime=None,label=None,use_xprime_labels=False,output_path='.',selected_features=None, **kwargs):
     '''
@@ -562,13 +677,13 @@ def _save_label_encoder(label_encoder, output_path):
         json.dump(label_encoder_dict, f)
 
         
-def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,log_name='training.log', weighted_training=False, write=False, output_name='vae_model.pkl', **kwargs):
+def train(model,svi, X,   X_prime=None,label=None,sampling=False,num_epochs=200,log_name='training.log',  write=False, output_name='vae_model.pkl', **kwargs):
     '''
     Train the VAE model using stochastic variational inference (SVI).
 
     Parameters:
         model (torch.nn.Module): The VAE model to be trained.
-        svi (pyro.infer.SVI): SVI object used for stochastic optimization.
+        svi (pyro.infer.SVI): SVI object used for stochastic optimization. 
         X (torch.Tensor): Spatial training data array.
         X_prime (torch.Tensor, optional): scRNA-seq training data array. Default: None.
         label (torch.Tensor, optional): Labels for the training data. Default: None.
@@ -589,6 +704,8 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
     # Prepare for training
     model.train()
     pyro.clear_param_store()
+    optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
+
     logging.basicConfig(filename=log_name, level=logging.INFO, format='%(asctime)s - %(message)s')
     # Convert data to PyTorch Tensors if necessary
     X = torch.from_numpy(X).type(torch.float) if isinstance(X, np.ndarray) else X
@@ -600,33 +717,65 @@ def train(model, svi, X,  X_prime=None,label=None,sampling=False,num_epochs=200,
     print ('loading data')
     if sampling:
         balanced_sampler = dataloader.BalancedSampler(label) if label is not None else None
-        data_loader = DataLoader(dataset, sampler=balanced_sampler, batch_size=kwargs.get('batch_size', 10000),shuffle=False)
+        data_loader = DataLoader(dataset, sampler=balanced_sampler, batch_size=kwargs.get('batch_size', 40000),shuffle=False)
     else:
-        data_loader = DataLoader(dataset, batch_size=kwargs.get('batch_size', 10000),shuffle=True)
-    if weighted_training:
-        class_counts = torch.bincount(label)
-        class_weights = 1. / class_counts.float()
-        class_weights = class_weights / class_weights.sum()  # Normalize weights
-    else:
-        class_weights = None
+        data_loader = DataLoader(dataset, batch_size=kwargs.get('', 40000),shuffle=True)
+
     # Training loop
     print ('start training')
     for epoch in range(num_epochs):
-        total_loss = 0.0       
+        n = 0
+        total_loss = 0.0
+        #stop_training = False
         for batch in data_loader:
             if len(batch)==3:
                 X,X_prime,label=batch
-                loss=svi.step(X=None,X_prime=X,L=None,class_weights=class_weights)
-                loss=svi.step(X=X_prime,X_prime=X,L=None,class_weights=class_weights)
-                loss=svi.step(X=X_prime,X_prime=X, L=label,class_weights=class_weights) #for historical reasons, X and X prime here are inverted
+                loss1=svi.step(X=None,X_prime=X,L=None,L_prime=None)
+                loss2=svi.step(X=X_prime,X_prime=X,L=None,L_prime=None)
+                loss3=svi.step(X=X_prime,X_prime=X, L=label,L_prime=None) #for historical reasons, X and X prime here are inverted
+                if n ==0 :
+                    current_losses = [loss1,loss2,loss3]
+                else:
+                    current_losses[0] +=loss1
+                    current_losses[1]+= loss2
+                    current_losses[2] += loss3
+                print (loss1,loss2,loss3)
+
             elif len(batch)==2:
                 X,label=batch
-                loss=svi.step(X=X,X_prime=None,L=None,class_weights=class_weights)
-                loss=svi.step(X=X,X_prime=None,L=label,class_weights=class_weights)
+                loss1=svi.step(X=X,X_prime=None,L=None)
+                loss2=svi.step(X=X,X_prime=None,L=label)
+                if n ==0 :
+                    current_losses = [loss1,loss2]
+                else:
+                    current_losses[0] +=loss1
+                    current_losses[1]+= loss2
+                    
             elif len(batch)==1:
                 X,=batch
-                loss=svi.step(X=X,X_prime=None,L=None,class_weights=class_weights)
-            total_loss+=loss
+                loss1=svi.step(X=X,X_prime=None,L=None)
+                print (loss1)
+                if n ==0 :
+                    current_losses = [loss1]
+                else:
+                    current_losses[0] +=loss1
+        '''
+        if epoch == 0:
+            previous_losses = current_losses
+        else:
+            if len(previous_losses) == len(current_losses) and all(current_loss < prev_loss for current_loss, prev_loss in zip(current_losses, previous_losses)):
+                previous_losses = current_losses
+                total_loss+=np.sum(current_losses)
+                avg_loss =total_loss/len(data_loader)
+                logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
+            else:
+                stop_training = True
+                break
+        
+        if stop_training:
+            break
+        '''
+        total_loss+=np.sum(current_losses)
         avg_loss =total_loss/len(data_loader)
         logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
     # Save the model if required

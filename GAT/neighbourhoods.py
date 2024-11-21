@@ -1,9 +1,31 @@
 import torch
+from torch_geometric.utils import negative_sampling
 from torch import nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv,dense
+from torch_geometric.nn import GATConv,dense,global_add_pool
 import logging
 
+
+class GATLayerWithSkip(nn.Module):
+    def __init__(self, in_dim, out_dim, heads=1, concat=False):
+        super(GATLayerWithSkip, self).__init__()
+        self.gat_conv = GATConv(in_dim, out_dim, heads=heads, concat=concat)
+        if in_dim != out_dim:
+            self.res_proj = nn.Linear(in_dim, out_dim)
+        else:
+            self.res_proj = None
+
+    def forward(self, x, edge_index):
+        identity = x
+        x = self.gat_conv(x, edge_index)
+        
+        if self.res_proj is not None:
+            identity = self.res_proj(identity)
+        
+        x = x + identity
+        return x
+
+    
 class minCUTPooling(nn.Module):
     """
     Graph Attention Network (GAT) with minCUT Pooling for microenvironment delineation with node-level attention mechanisms
@@ -19,7 +41,7 @@ class minCUTPooling(nn.Module):
         bnList=[]
         prev_dim = in_dim
         for hidden_dim in hidden_dims:
-            GATconvList.append(GATConv(prev_dim, hidden_dim, heads=heads, concat=False))
+            GATconvList.append(GATLayerWithSkip(prev_dim, hidden_dim, heads=heads, concat=False))
             bnList.append(nn.BatchNorm1d(hidden_dim))
             prev_dim = hidden_dim
         self.convs=nn.Sequential(*GATconvList)
@@ -61,19 +83,50 @@ class minCUTPooling(nn.Module):
             
         return outputs
 
-def _loss_smo(embedding,edge_index):
+class DGI(nn.Module):
+    def __init__(self, gat_model, mode='self-supervised'):
+        super(DGI, self).__init__()
+        self.gnn = gat_model
+        self.readout = global_add_pool
+        self.sigm = nn.Sigmoid()
+        self.bce_loss = nn.BCEWithLogitsLoss()
+        self.mode = mode
     
-    #add a smoothness penalty term to penalize differences between H_i and H_i+1
-    delta = embedding[edge_index[0]] - embedding[edge_index[1]]
-    return torch.sum (torch.norm (delta,p=2, dim=1))
+    def forward(self, x, edge_index, neg_edge_index):
+        pos_z = self.gnn(x, edge_index)
+        neg_z = self.gnn(x, neg_edge_index)
+        summary = self.sigm(self.readout(pos_z[-1], torch.arange(pos_z[-1].size(0), device=x.device)))
+        
+        pos_score = (pos_z[-1] * summary).sum(dim=1)
+        neg_score = (neg_z[-1] * summary).sum(dim=1)
+        
+        return pos_score, neg_score 
 
+    def calculate_loss(self, pos_score, neg_score, x=None, edge_index=None):
+        y = torch.cat([torch.ones(pos_score.size(0), device=pos_score.device), torch.zeros(neg_score.size(0), device=neg_score.device)])
+        scores = torch.cat([pos_score, neg_score])
+        dgi_loss = self.bce_loss(scores, y)
+        
+        if self.mode == 'self-supervised':
+            return dgi_loss
+        elif self.mode == 'supervised':
+            if x is None:
+                raise ValueError("Parameter 'x' must be provided.")
+            if edge_index is None:
+                raise ValueError("Parameter 'edge_index' must be provided.")
+            
+            pos_z = self.gnn(x, edge_index)
+            h, adj, lc, lo = dense.dense_mincut_pool(x, edge_index.to_dense(), pos_z[-1])
+            total_loss = dgi_loss + (lc + lo)
+            return total_loss, dgi_loss, lc + lo
+        
 
-def train(GATmodel,VAEmodel, optimizer_gat, A_list, X_list ,num_epochs=200,log_name='GATtraining.log', alpha = 1e-6 , **kwargs):
+def train(model,VAEmodel, optimizer_gat, A_list, X_list ,patience = 5, num_epochs=200,log_name='GATtraining.log', alpha = 1e-6 , **kwargs):
     """
     Training function for the GAT model.
 
     Parameters:
-        GATmodel: SPARROW GAT model instance.
+        model: SPARROW GAT model instance.
         VAEmodel: SPARROW VAE model (needs to be fully trained).
         optimizer_gat: GAT model optimizer.
         A_list (list): List of adjacency matrices.
@@ -84,25 +137,60 @@ def train(GATmodel,VAEmodel, optimizer_gat, A_list, X_list ,num_epochs=200,log_n
         **kwargs: Additional arguments.
     """
     VAEmodel.eval()
-    GATmodel.train()
-    logging.basicConfig(filename=log_name, level=logging.INFO, format='%(asctime)s - %(message)s')
+    model.train()
+    logging.basicConfig( level=logging.INFO, format='%(asctime)s - %(message)s',
+                           handlers=[
+                    logging.FileHandler(log_name),
+                    logging.StreamHandler()])
+    prev_dgi_loss = float('inf')
+    prev_mincut_loss = float('inf')
+    patience_counter = 0    
     for epoch in range (num_epochs):
+        prev_dgi_loss_list=[]
+        prev_mincut_loss_list=[]
+  
+        print(f'epoch {epoch}')
         total_loss=0.0
         for i, (A, X) in enumerate(zip(A_list, X_list)):
             try:
                 with torch.no_grad():
                     loc, scale = VAEmodel.Encoder(X)
                 optimizer_gat.zero_grad()
-                embeddings = GATmodel(loc, A.coalesce().indices())
-                loss = 0 
-                for embedding in embeddings:
-                    x, adj, lc, lo = dense.dense_mincut_pool(loc, A.to_dense(), embedding)
-                    loss += (lc + lo + alpha * _loss_smo(embedding,  A.coalesce().indices() )) 
-                loss.backward()
-                total_loss += loss.item()
-                optimizer_gat.step()
+                neg_edge_index = negative_sampling(A.coalesce().indices(),num_nodes=len(X))
+                pos_score, neg_score = model(loc, A.coalesce().indices(), neg_edge_index)
+                if model.mode =='supervised':
+                    loss, dgi_loss , mincut_loss = model.calculate_loss(pos_score, neg_score , loc, A.coalesce() )
+                    
+                    prev_dgi_loss_list.append(dgi_loss.item())
+                    prev_mincut_loss_list.append(mincut_loss.item())
+                    if epoch > 0:
+                        #print (dgi_loss_list[i])
+                        #print (mincut_loss_list[i])
+                        if (dgi_loss.item() > dgi_loss_list[i] and mincut_loss.item() < mincut_loss_list[i]) or (dgi_loss.item() < dgi_loss_list[i] and mincut_loss.item() > mincut_loss_list[i]) or (dgi_loss.item() > dgi_loss_list[i] and mincut_loss.item() > mincut_loss_list[i]):
+                            patience_counter+=1
+                            if patience_counter >=patience:
+                                print(f"Early stopping at epoch {epoch}")
+                                logging.info(f"Early stopping at epoch {epoch + 1}")
+                                return
+                        else:
+                            patience_counter = 0
+             
+                    loss.backward()
+                    total_loss += loss.item()
+                    print (loss.item(), patience_counter) 
+                    optimizer_gat.step()
+                    
+                else: 
+                    dgi_loss = model.calculate_loss(pos_score, neg_score,embedding)
+                    dgi_loss.backward()
+                    total_loss += dgi_loss.item()
+                    optimizer_gat.step()
+                    
             except Exception as e:
-                logging.error(f"Error during training on batch {i}: {e}")       
+                print (e)
+                logging.error(f"Error during training on batch {i}: {e}")     
+        dgi_loss_list = prev_dgi_loss_list.copy()
+        mincut_loss_list = prev_mincut_loss_list.copy()
         avg_loss=total_loss/len(A_list)
         logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
         

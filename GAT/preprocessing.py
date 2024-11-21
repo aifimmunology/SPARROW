@@ -146,8 +146,10 @@ def graph_loader(obj,genes,x0,x1,y0,y1,stepsize,k_neighbours,min_sum=5, **kwargs
             selected_training_cells=obj.parquet.compute().loc[obj.geometry.cx[x0+i:x0+i+stepsize,
                                                                               y0+j:y0+j+stepsize].index,genes]
             selected_training_cells=selected_training_cells[selected_training_cells.sum(axis=1) >=min_sum]
+            
             if len(selected_training_cells) > kwargs.get('min_length',3000): #this is an arbitrary number just so edges with disturbed structures aren't included in training
                 X_list.append(torch.from_numpy(selected_training_cells.values).type(torch.float))
-                A=_make_A(obj.geometry.loc[ selected_training_cells.index], k_neighbours,kwargs.get('w_method','knn'))
+                print (selected_training_cells.shape)
+                A=_make_A(obj.geometry.loc[ selected_training_cells.index].set_index(np.arange(len(selected_training_cells))), k_neighbours, kwargs.get('w_method','knn'))
                 A_list.append( A)
     return A_list,X_list
