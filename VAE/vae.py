@@ -613,7 +613,7 @@ def _split_data(X, X_prime, label, genes, kwargs, output_path):
 
     # Extract scRNA-seq data if provided
     if X_prime is not None:
-        X_prime_data = np.asarray(X_prime.X[:, np.where(X_prime.var.index.isin(genes))[0]].todense())
+        X_prime_data = np.asarray(X_prime.X[:,[ np.where(X_prime.var.index == gene)[0][0] for gene in genes]].todense())
 
     # Split data into training and testing sets
     if label is not None:
@@ -726,7 +726,6 @@ def train(model,svi, X,   X_prime=None,label=None,sampling=False,num_epochs=200,
     for epoch in range(num_epochs):
         n = 0
         total_loss = 0.0
-        #stop_training = False
         for batch in data_loader:
             if len(batch)==3:
                 X,X_prime,label=batch
@@ -759,22 +758,7 @@ def train(model,svi, X,   X_prime=None,label=None,sampling=False,num_epochs=200,
                     current_losses = [loss1]
                 else:
                     current_losses[0] +=loss1
-        '''
-        if epoch == 0:
-            previous_losses = current_losses
-        else:
-            if len(previous_losses) == len(current_losses) and all(current_loss < prev_loss for current_loss, prev_loss in zip(current_losses, previous_losses)):
-                previous_losses = current_losses
-                total_loss+=np.sum(current_losses)
-                avg_loss =total_loss/len(data_loader)
-                logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
-            else:
-                stop_training = True
-                break
-        
-        if stop_training:
-            break
-        '''
+
         total_loss+=np.sum(current_losses)
         avg_loss =total_loss/len(data_loader)
         logging.info(f'Epoch {epoch + 1}/{num_epochs}, Average Loss: {avg_loss:.4f}')
