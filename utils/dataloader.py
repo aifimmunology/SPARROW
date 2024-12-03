@@ -8,11 +8,11 @@ class Dataloader(Dataset):
 
     Parameters:
         x: Tensor
-            Spatial training data
+            
         x_prime: Tensor, optional
-            scRNA-seq training data
+            
         label: Tensor, optional
-            Label tensor (default: None).
+            
     """
     def __init__(self, x, x_prime=None, label=None):
         self.x = x
@@ -31,14 +31,11 @@ class Dataloader(Dataset):
         x_prime = self.x_prime[idx % len(self.x_prime)] if self.has_x_prime else None
         return tuple(filter(lambda val: val is not None, (x, x_prime, label)))
 
-
 class BalancedSampler(Sampler):
     """
     A custom sampler that samples underrepresented classes more frequently.
 
-    Parameters:
-    label: Tensor
-        The tensor containing labels for balancing.
+
     """
     def __init__(self, label):
         self.label = label

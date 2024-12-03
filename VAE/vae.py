@@ -738,7 +738,7 @@ def train(model,svi, X,   X_prime=None,label=None,sampling=False,num_epochs=200,
                     current_losses[0] +=loss1
                     current_losses[1]+= loss2
                     current_losses[2] += loss3
-                print (loss1,loss2,loss3)
+                #print (loss1,loss2,loss3)
 
             elif len(batch)==2:
                 X,label=batch
@@ -753,7 +753,7 @@ def train(model,svi, X,   X_prime=None,label=None,sampling=False,num_epochs=200,
             elif len(batch)==1:
                 X,=batch
                 loss1=svi.step(X=X,X_prime=None,L=None)
-                print (loss1)
+                #print (loss1)
                 if n ==0 :
                     current_losses = [loss1]
                 else:
